@@ -1,224 +1,204 @@
-# q3_timeseries.ps1
-# Zeitlicher Verlauf (täglich/wochenweise) + Totals je Autor aus bare repo
+# timeseries_bare_branch_authors.ps1
+# Autor-gefilterte Zeitreihe (täglich, kumuliert) für EINEN Branch in einem BARE repo.
+# Output-CSV liegt im selben Ordner wie dieses Skript. Hält das Fenster am Ende offen.
 
+$ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 
-# ===== Konfiguration =====
-$gitDir   = "C:\NET\working\Git\RS2.git"     # bare repo
-$since    = "2025-07-01"
-$until    = "2025-09-30 23:59:59"
-$granularity = "Day"                         # "Day" oder "Week"
-
-# Haupt-Branch-Präferenz (Reihenfolge)
-$preferredBranches = @("origin/main","origin/master")
-
-# Als "Code" werten:
-$validExt = @(
-  ".cs",
-  ".ts",".tsx",".js",".jsx"#,
-  #".css",".scss",
-  #".xml"  # ggf. rausnehmen, falls zu laut
-)
-
-# Ordner ausschließen (Teilpfade, case-insensitive)
-$skipDirs = @("bin","obj","dist","node_modules","wwwroot\lib","packages","generated","migrations")
-
-# Ausgabedateien
-$outCsvTimeseries = "C:\NET\working\Git\q3_lines_timeseries_filtered.csv"
-$outCsvPerAuthor  = "C:\NET\working\Git\q3_lines_per_author_filtered.csv"
-
-# Exakte Autoren (per E-Mail)
-$authorEmails = @(
-  "Pavol.Martiniak@aptean.com",
-  "Sebastian.Arnauer@aptean.com",
-  "Matthias.Kuehtreiber@aptean.com",
-  "Peter.Erlsbacher@aptean.com",
-  "Peter.Haubenburger@aptean.com",
-  "Michaela.Prichocka@ezmid.com",
-  "nnell@aptean.com",
-  "Fabian.Rausch-Schott@aptean.com"
-) | ForEach-Object { $_.ToLower() }
-# =========================
-
-function Get-ExistingBranches {
-  param([string[]]$prefs)
-  $allRefs = git --git-dir="$gitDir" show-ref --heads --remotes 2>$null
-  $found = @()
-  foreach ($p in $prefs) {
-    if ($allRefs -match [regex]::Escape($p)) { $found += $p }
-  }
-  if ($found.Count -gt 0) { return $found }
-
-  # Fallback: übliche Main-Refs
-  $candidates = @()
-  foreach ($line in $allRefs) {
-    if ($line -match 'refs/remotes/.+') {
-      $ref = ($line -split '\s+')[1]
-      if ($ref -match '/(main|master|develop)$') { $candidates += $ref }
-    }
-  }
-  if ($candidates.Count -gt 0) { return $candidates }
-
-  return @("--all")
-}
-
-function Get-GroupKey([datetime]$dt, [string]$gran) {
-  if ($null -eq $dt) { return $null }
-  switch ($gran) {
-    "Week" {
-      $offset = (([int]$dt.DayOfWeek + 6) % 7)  # Montag als Start
-      return $dt.Date.AddDays(-$offset).ToString("yyyy-MM-dd")
-    }
-    default { return $dt.Date.ToString("yyyy-MM-dd") }
-  }
-}
-
-function Should-SkipPath([string]$path) {
-  $p = $path -replace '/','\'  # normalisieren
-  foreach ($d in $skipDirs) {
-    if ($p.ToLower().Contains("\$($d.ToLower())\")) { return $true }
-    if ($p.ToLower().EndsWith("\$($d.ToLower())")) { return $true }
-  }
-  return $false
-}
-
-# --- Branch-Auswahl
-$branches = Get-ExistingBranches -prefs $preferredBranches
-Write-Host "Analysiere Branch(es): $($branches -join ', ')"
-$branchArgs = $branches
-
-# --- Git-Args korrekt als Array bauen
-$logArgs = @(
-  "--since=$since","--until=$until",
-  "--no-merges","--date=short",
-  '--pretty=format:@%H|%ad|%an|%ae','--numstat'
-)
-
-$gitArgs = @("--git-dir=$gitDir","log")
-if ($branchArgs -ne @("--all")) {
-  $gitArgs += $branchArgs
-  $gitArgs += "--first-parent"
-} else {
-  $gitArgs += "--all"
-}
-$gitArgs += $logArgs
-
-# Git vorhanden?
-$gitPath = (Get-Command git -ErrorAction SilentlyContinue).Path
-if (-not $gitPath) { Write-Host "Git nicht gefunden (PATH prüfen)." -ForegroundColor Red; return }
-Write-Host "Verwende Git: $gitPath"
-
-# --- Log abrufen
-$lines = & git @gitArgs 2>$null
-
-# --- Aggregation vorbereiten
-$aggByDay = @{}     # yyyy-mm-dd -> @{Added;Deleted}
-$aggByAuthor = @{}  # email -> @{Added;Deleted;Commits}
-
-$currentDate  = $null
-$currentEmail = $null
-
-foreach ($line in $lines) {
-  if ($line.StartsWith("@")) {
-    # Header: @<hash>|<date>|<author>|<email>
-    $rest  = $line.Substring(1)
-    $parts = $rest.Split("|",4,[System.StringSplitOptions]::None)
-    if ($parts.Count -ge 4) {
-      $dateStr = $parts[1].Trim()
-      $email   = $parts[3].Trim().ToLower()
-      try { $currentDate = [datetime]::ParseExact($dateStr, "yyyy-MM-dd", $null) } catch { $currentDate = $null }
-
-      if ($authorEmails -contains $email) {
-        $currentEmail = $email
-        if (-not $aggByAuthor.ContainsKey($currentEmail)) { $aggByAuthor[$currentEmail] = @{Added=0;Deleted=0;Commits=0} }
-        $aggByAuthor[$currentEmail].Commits += 1
-      } else {
-        $currentEmail = $null
-      }
+function Pause-ForUser {
+  try {
+    if ($Host.Name -match 'ConsoleHost') {
+      Write-Host "`nPress any key to close..."
+      $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
     } else {
-      $currentDate = $null
-      $currentEmail = $null
+      Read-Host "`nPress Enter to close"
     }
-    continue
-  }
-
-  # numstat: "<added> <deleted> <path>" (binär: '-' '-')
-  $p = $line -split "\s+"
-  if ($p.Length -ge 3 -and $p[0] -match '^\d+$' -and $p[1] -match '^\d+$') {
-    if ($null -eq $currentDate)  { continue }
-    if ($null -eq $currentEmail) { continue }
-
-    $added   = [int]$p[0]
-    $deleted = [int]$p[1]
-    $path    = $p[2]
-
-    $ext = [IO.Path]::GetExtension($path)
-    if (-not ($validExt -contains $ext)) { continue }
-    if (Should-SkipPath $path) { continue }
-
-    $key = Get-GroupKey -dt $currentDate -gran $granularity
-    if ($null -eq $key) { continue }
-
-    if (-not $aggByDay.ContainsKey($key)) { $aggByDay[$key] = @{Added=0;Deleted=0} }
-    $aggByDay[$key].Added   += $added
-    $aggByDay[$key].Deleted += $deleted
-
-    $aggByAuthor[$currentEmail].Added   += $added
-    $aggByAuthor[$currentEmail].Deleted += $deleted
-  }
+  } catch {}
 }
 
-# --- Zeitreihe (das ist dein zeitlicher Verlauf)
-$cumAdd = 0; $cumDel = 0
-$rows = @()
-$sortedKeys = $aggByDay.Keys | Sort-Object { [datetime]::ParseExact($_, "yyyy-MM-dd", $null) }
-foreach ($k in $sortedKeys) {
-  $a = $aggByDay[$k].Added
-  $d = $aggByDay[$k].Deleted
-  $cumAdd += $a
-  $cumDel += $d
-  $rows += [pscustomobject]@{
-    Date       = $k
-    Added      = $a
-    Deleted    = $d
-    Net        = $a - $d
-    CumAdded   = $cumAdd
-    CumDeleted = $cumDel
-    CumNet     = $cumAdd - $cumDel
-  }
-}
+try {
+  # === Konfiguration ===
+  $gitDir  = "C:\NET\working\Git\RS2.git"     # BARE repository
+  $branchIn = "user/mkuehtreiber/530/20250929_QM"           # dein Zielzweig (Kurzname). Leer lassen => auto (main/master/HEAD)
+  $since   = "2025-07-01"
+  $until   = "2025-09-30 23:59:59"
 
-if ($rows.Count -gt 0) {
-  $rows | Export-Csv -Path $outCsvTimeseries -NoTypeInformation -Encoding UTF8
-  Write-Host "Zeitreihe geschrieben: $outCsvTimeseries"
-  Write-Host "Beispiel (erste 5 Zeilen):"
-  $rows | Select-Object -First 5 | Format-Table -AutoSize
-  Write-Host "… und letzte 5:"
-  $rows | Select-Object -Last 5 | Format-Table -AutoSize
-} else {
-  Write-Host "Keine Zeitreihen-Daten nach Filtern gefunden." -ForegroundColor Yellow
-}
+  # PR-Merges mitzählen (empfohlen: $true)
+  $includeMerges = $true
 
-# --- Per-Author Totals
-$rowsAuthors = @()
-foreach ($mail in $aggByAuthor.Keys | Sort-Object) {
-  $A = $aggByAuthor[$mail]
-  $rowsAuthors += [pscustomobject]@{
-    AuthorEmail = $mail
-    Commits     = $A.Commits
-    Added       = $A.Added
-    Deleted     = $A.Deleted
-    Net         = $A.Added - $A.Deleted
+  # Nur diese Autor:innen (Match gegen Author-ODER-Committer-E-Mail)
+  $authorEmails = @(
+    "Pavol.Martiniak@aptean.com",
+    "Sebastian.Arnauer@aptean.com",
+    "Matthias.Kuehtreiber@aptean.com",
+    "Peter.Erlsbacher@aptean.com",
+    "Peter.Haubenburger@aptean.com",
+    "Michaela.Prichocka@ezmid.com",
+    "nnell@aptean.com",
+    "Fabian.Rausch-Schott@aptean.com"
+  ) | ForEach-Object { $_.ToLower() }
+
+  # Dateitypen/Ordner einschränken (leer = alles zählen)
+  $validExt = @(".cs",".cshtml",".sql",".ts",".tsx",".js",".jsx",".css",".scss",".xml")
+  $skipDirs = @("bin","obj","dist","node_modules","wwwroot\lib","packages","generated","migrations")
+
+  function Should-SkipPath([string]$path) {
+    if (-not $path) { return $false }
+    $p = $path -replace '/','\'
+    foreach ($d in $skipDirs) {
+      $dLow = $d.ToLower()
+      if ($p.ToLower().Contains("\$dLow\")) { return $true }
+      if ($p.ToLower().EndsWith("\$dLow"))  { return $true }
+    }
+    return $false
   }
-}
-if ($rowsAuthors.Count -gt 0) {
-  $rowsAuthors | Export-Csv -Path $outCsvPerAuthor -NoTypeInformation -Encoding UTF8
-  Write-Host "Per-Autor-Übersicht geschrieben: $outCsvPerAuthor"
+
+  if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw "Git not found in PATH." }
+  if (-not (Test-Path $gitDir)) { throw "gitDir not found: $gitDir" }
+
+  # === Branch-Auflösung für BARE repo: refs/heads/<name>, fallback main/master, sonst HEAD ===
+  function Resolve-HeadRef([string]$gitDir, [string]$name) {
+    # Hilfsfunktion: gibt kurze ref (z.B. 'refs/heads/feature/x') zurück, wenn vorhanden
+    function _exists($short) {
+      & git --git-dir=$gitDir rev-parse --verify --quiet $short *> $null
+      return ($LASTEXITCODE -eq 0)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($name)) {
+      $exact = "refs/heads/$name"
+      if (_exists $exact) { return $exact }
+
+      # Teilstring-Suche über alle heads; wenn nur ein Treffer -> nimm den
+      $heads = & git --git-dir=$gitDir for-each-ref --format="%(refname:short)" refs/heads 2>$null
+      $cands = @($heads | Where-Object { $_ -like "*$name*" })
+      if ($cands.Count -eq 1) { return "refs/heads/$($cands[0])" }
+      if ($cands.Count -gt 1) {
+        Write-Host "Multiple matching heads found for '$name':" -ForegroundColor Yellow
+        $cands | ForEach-Object { Write-Host "  $_" }
+        throw "Please set an exact branch name (one of the above)."
+      }
+      # sonst weiter unten mit defaults
+    }
+
+    foreach ($def in @("refs/heads/main","refs/heads/master")) {
+      if (_exists $def) { return $def }
+    }
+
+    # letzter Fallback: HEAD
+    & git --git-dir=$gitDir rev-parse --verify --quiet HEAD *> $null
+    if ($LASTEXITCODE -eq 0) { return "HEAD" }
+
+    throw "No suitable branch found (no heads/main/master/HEAD)."
+  }
+
+  $resolved = Resolve-HeadRef $gitDir $branchIn
+  $resolvedDisplay = $resolved
+  if ($resolved -eq "HEAD") {
+    # Git log ohne ref-arg, damit HEAD genommen wird
+    $branchArgs = @()
+  } else {
+    $branchArgs = @($resolved)
+  }
+
+  # === Output-Datei im Skriptordner ===
+  $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+  $sinceDate = ($since -split '\s+')[0]; $untilDate = ($until -split '\s+')[0]
+  $branchSafe = ($resolvedDisplay -replace '[^A-Za-z0-9._-]','_')
+  $outCsv = Join-Path $scriptDir "timeseries_${branchSafe}_authors_${sinceDate}_to_${untilDate}.csv"
+
+  Write-Host "Repo (bare): $gitDir"
+  Write-Host "Branch:      $resolvedDisplay"
+  Write-Host "Range:       $since .. $until"
+  Write-Host "Output:      $outCsv`n"
+
+  # === Git-Log (bare) abrufen: -w (ignore whitespace), -M (renames), optional --no-merges ===
+  $mergeFlag = if ($includeMerges) { @() } else { @("--no-merges") }
+  $lines = & git --git-dir=$gitDir log @branchArgs `
+            --since="$since" --until="$until" -w -M --date=short `
+            @mergeFlag --pretty=format:"@%ad|%ae|%ce|%s" --numstat 2>$null
+
+  # === Parsen & aggregieren (nur Author/Committer in $authorEmails) ===
+  $agg = @{}; $cumAdd = 0; $cumDel = 0
+  $currentDate=$null; $currAuth=$null; $currComm=$null
+  $totalCommits=0; $matchedCommits=0; $samples=@()
+
+  foreach ($line in $lines) {
+    if ($line.StartsWith("@")) {
+      $totalCommits++
+      $currentDate=$null; $currAuth=$null; $currComm=$null
+      $parts = $line.Substring(1).Split("|",4,[System.StringSplitOptions]::None)
+      if ($parts.Count -ge 3) {
+        try { $currentDate = [datetime]::ParseExact($parts[0].Trim(),"yyyy-MM-dd",$null) } catch {}
+        $ae = $parts[1].Trim().ToLower()
+        $ce = $parts[2].Trim().ToLower()
+        if (($authorEmails -contains $ae) -or ($authorEmails -contains $ce)) {
+          $currAuth=$ae; $currComm=$ce
+          $matchedCommits++
+          if ($samples.Count -lt 5) { $samples += $line.Substring(1) }
+        }
+      }
+      continue
+    }
+
+    $p = $line -split "\s+"
+    if ($p.Length -ge 3 -and $p[0] -match '^\d+$' -and $p[1] -match '^\d+$') {
+      if ($null -eq $currentDate) { continue }
+      if ($null -eq $currAuth -and $null -eq $currComm) { continue }
+
+      $path = $p[2]
+      if ($validExt.Count -gt 0) {
+        $ext = [IO.Path]::GetExtension($path)
+        if (-not ($validExt -contains $ext)) { continue }
+      }
+      if (Should-SkipPath $path) { continue }
+
+      $key = $currentDate.ToString("yyyy-MM-dd")
+      if (-not $agg.ContainsKey($key)) { $agg[$key] = @{Added=0;Deleted=0} }
+      $agg[$key].Added   += [int]$p[0]
+      $agg[$key].Deleted += [int]$p[1]
+    }
+  }
+
+  # === Zeitreihe bauen ===
+  $rows=@()
+  foreach ($k in ($agg.Keys | Sort-Object)) {
+    $a=$agg[$k].Added; $d=$agg[$k].Deleted
+    $cumAdd += $a; $cumDel += $d
+    $rows += [pscustomobject]@{
+      Date       = $k
+      Added      = $a
+      Deleted    = $d
+      Net        = $a - $d
+      CumAdded   = $cumAdd
+      CumDeleted = $cumDel
+      CumNet     = $cumAdd - $cumDel
+    }
+  }
+
+  Write-Host ("Commits in range (all):        {0}" -f $totalCommits)
+  Write-Host ("Commits matched (A/C emails):  {0}" -f $matchedCommits)
+  if ($samples.Count -gt 0) {
+    Write-Host "Sample matches:"
+    $samples | ForEach-Object { Write-Host "  $_" }
+  }
   Write-Host ""
-  Write-Host "Totals:"
-  $rowsAuthors | Sort-Object Net -Descending | Format-Table -AutoSize
-}
 
-Write-Host ""
-Write-Host "Drück eine Taste zum Schließen…"
-[void][System.Console]::ReadKey($true)
+  if ($rows.Count -gt 0) {
+    $rows | Export-Csv -Path $outCsv -NoTypeInformation -Encoding UTF8
+    Write-Host "Written: $outCsv"
+  } else {
+    Write-Host "??  No matching changes found."
+    Write-Host "Hints:"
+    Write-Host "  • List heads:  git --git-dir=""$gitDir"" for-each-ref --format=""%(refname:short)"" refs/heads"
+    Write-Host "  • Set `$branchIn exactly as in the list."
+    Write-Host "  • Set `$includeMerges = `$true for PR merges."
+    Write-Host "  • Relax `$validExt / `$skipDirs (empty lists count everything)."
+  }
+}
+catch {
+  Write-Host "`nERROR: $($_.Exception.Message)" -ForegroundColor Red
+  if ($_.InvocationInfo) { Write-Host $_.InvocationInfo.PositionMessage }
+}
+finally {
+  Pause-ForUser
+}
